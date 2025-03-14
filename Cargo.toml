@@ -1,0 +1,16 @@
+[package]
+name = "audio-visualizer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ecolor = "0.31.1"
+eframe = "0.31.1"
+egui = { version = "0.31.1", features = ["color-hex", "serde"]}
+fixed = "1.29.0"
+hound = "3.5.1"
+num-complex = "0.4.6"
+rfd = "0.15.2"
+ringbuf = "0.4.7"
+rustfft = "6.2.0"
+symphonia = { version = "0.5.4", features = ["mp3", "wav", "flac", "aac"]}
