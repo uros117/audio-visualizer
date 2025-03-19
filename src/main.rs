@@ -126,21 +126,34 @@ impl AudioVisualizer {
         let visible_samples_start = (scroll_offset.to_num::<f64>() * self.sample_rate as f64 * self.num_channels as f64) as u64;
         let visible_samples_end = ((scroll_offset + visible_time_window).to_num::<f64>() * self.sample_rate as f64 * self.num_channels as f64) as u64;
 
-        // Check if we're near the start of our buffer
-        if visible_samples_start < self.chunk_start + self.chunk_size {
-            // Need to load backwards if possible
-            if self.chunk_start > 0 {
-                let new_start = self.chunk_start.saturating_sub(self.chunk_size);
-                self.load_chunk_at_position(new_start);
-            }
-        }
+        // Calculate what chunk the visible area starts and ends in
+        let start_chunk = visible_samples_start / self.chunk_size;
+        let end_chunk = (visible_samples_end + self.chunk_size - 1) / self.chunk_size; // Ceiling division
 
-        // Check if we're near the end of our buffer
-        let buffer_end = self.chunk_start + (self.chunks.len() as u64 * self.chunk_size);
-        if visible_samples_end > buffer_end.saturating_sub(self.chunk_size) {
-            // Need to load forward if possible
-            if buffer_end < self.total_samples {
-                self.load_chunk_at_position(buffer_end);
+        // Load a few chunks ahead and behind
+        let buffer_chunks = 2; // Number of chunks to buffer in each direction
+
+        // Calculate the range of chunks we should have loaded
+        let should_load_start = start_chunk.saturating_sub(buffer_chunks);
+        let should_load_end = end_chunk + buffer_chunks;
+
+        // Request chunks that should be loaded
+        for chunk_idx in should_load_start..=should_load_end {
+            let chunk_pos = chunk_idx * self.chunk_size;
+
+            // Check if this chunk is already loaded or pending
+            let is_loaded = if chunk_pos < self.chunk_start {
+                false // Before our buffer
+            } else {
+                let relative_pos = chunk_pos - self.chunk_start;
+                let idx = (relative_pos / self.chunk_size) as usize;
+                idx < self.chunks.len()
+            };
+
+            let is_pending = self.pending_chunks.contains(&chunk_pos);
+
+            if !is_loaded && !is_pending && chunk_pos < self.total_samples {
+                self.load_chunk_at_position(chunk_pos);
             }
         }
     }
@@ -259,7 +272,7 @@ impl AudioVisualizer {
                              sample_rate, num_channels, total_samples);
                     self.sample_rate = sample_rate;
                     self.num_channels = num_channels;
-                    self.total_samples = total_samples;
+                    // self.total_samples = total_samples;
                     
                     // Update the waveform widget with audio info
                     self.waveform_widget.set_audio_info(sample_rate, num_channels, total_samples);
