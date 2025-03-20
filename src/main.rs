@@ -1,9 +1,13 @@
 mod audio_loader;
 mod waveform_widget;
+mod audio_range;
+mod audio_storage;
 
-use std::collections::VecDeque;
+use std::sync::RwLock;
+use std::{collections::VecDeque, sync::Arc};
 use std::path::PathBuf;
 
+use audio_storage::AudioBufferManager;
 use eframe::egui;
 use egui::{Vec2, ViewportBuilder};
 use rfd::FileDialog;
@@ -16,7 +20,6 @@ const BUFFER_SIZE: usize = 1024; // 1MB chunks for loading
 
 struct AudioVisualizer {
     file_path: Option<PathBuf>,
-    spectrum: Vec<f32>,
     loaded_percentage: f32,
     
     // Audio state
@@ -26,27 +29,32 @@ struct AudioVisualizer {
     sample_rate: u32,
     num_channels: u16,
     
-    // Chunks storage
-    chunks: VecDeque<Vec<f32>>,
-    max_chunks: usize,
+
+    // Audio storage
+    buffer_manager: Option<audio_storage::AudioBufferManager>,
     
     // Loading state
     is_loading: bool,
-    pending_chunks: Vec<u64>,
     
     // Loader
-    audio_loader: AudioLoader,
+    audio_loader: Arc<RwLock<AudioLoader>>,
     
     // Waveform widget
     waveform_widget: WaveformWidget,
+
+    // Visible range tracking
+    visible_range: audio_range::AudioRange,
+    
+    // Pre-buffer range for playback (when playing)
+    playing: bool,
+    play_position: u64,
+    playback_range: Option<audio_range::AudioRange>,
 }
 
 impl Default for AudioVisualizer {
     fn default() -> Self {
-        let max_chunks = 10240;
         Self {
             file_path: None,
-            spectrum: vec![0.0; FFT_SIZE / 2],
             loaded_percentage: 0.0,
             chunk_start: 0,
             chunk_size: BUFFER_SIZE as u64,
@@ -54,11 +62,13 @@ impl Default for AudioVisualizer {
             sample_rate: 44100,
             num_channels: 2,
             is_loading: false,
-            max_chunks,
-            pending_chunks: Vec::new(),
-            chunks: VecDeque::with_capacity(max_chunks),
-            audio_loader: AudioLoader::new(),
+            audio_loader: Arc::new(RwLock::new(AudioLoader::new())),
             waveform_widget: WaveformWidget::new(),
+            buffer_manager: None,
+            visible_range: audio_range::AudioRange { start: 0, end: 10, priority: 0 },
+            playing: false,
+            play_position: 0,
+            playback_range: None,
         }
     }
 }
@@ -76,37 +86,61 @@ impl AudioVisualizer {
             println!("Opening file: {:?}", path);
             
             // Stop any existing loader
-            if self.audio_loader.is_running() {
-                self.audio_loader.stop();
+            {
+                let mut loader = self.audio_loader.write().unwrap();
+                if loader.is_running() {
+                    loader.stop();
+                }
             }
             
             // Clear existing chunks
-            self.chunks.clear();
-            self.spectrum = vec![0.0; FFT_SIZE / 2];
+            if let Some(buff) = &mut self.buffer_manager {
+                buff.clear();
+            }
+
             self.loaded_percentage = 0.0;
             self.chunk_start = 0;
-            self.pending_chunks.clear();
+
+            // Reset the playback
+            self.playing = false;
+            self.play_position = 0;
+            self.playback_range = None;
             
             // Start the loader
-            match self.audio_loader.start(path.clone(), BUFFER_SIZE as u64) {
-                Ok(()) => {
-                    println!("Loader started successfully");
-                    self.file_path = Some(path);
-                    
-                    // Get file info from loader
-                    let (sample_rate, num_channels, total_samples) = self.audio_loader.get_info();
-                    self.sample_rate = sample_rate;
-                    self.num_channels = num_channels;
-                    self.total_samples = total_samples;
-                    
-                    // Update the waveform widget with the audio info
-                    self.waveform_widget.set_audio_info(sample_rate, num_channels, total_samples);
-                    
-                    // Request the first chunk
-                    self.load_chunk_at_position(0);
-                },
-                Err(e) => {
-                    println!("Error starting loader: {}", e);
+            {
+                let mut loader = self.audio_loader.write().unwrap();
+                match loader.start(path.clone(), BUFFER_SIZE as u64) {
+                    Ok(()) => {
+                        println!("Loader started successfully");
+                        self.file_path = Some(path);
+                        
+                        // Get file info from loader
+                        let (sample_rate, num_channels, total_samples) = loader.get_info();
+                        self.sample_rate = sample_rate;
+                        self.num_channels = num_channels;
+                        self.total_samples = total_samples;
+                        
+                        // Update the waveform widget with the audio info
+                        self.waveform_widget.set_audio_info(sample_rate, num_channels, total_samples);
+                        
+                        // Create the buffer manager
+                        let max_samples = 60 * sample_rate as u64 * num_channels as u64; // Store up to 60 seconds
+                        self.buffer_manager = Some(audio_storage::AudioBufferManager::new(
+                            sample_rate,
+                            num_channels,
+                            max_samples,
+                            self.audio_loader.clone(),
+                            BUFFER_SIZE as u64
+                        ));
+                        
+                        // Initialize the visible range
+                        let visible_samples = (self.waveform_widget.visible_time_window().to_num::<f64>() 
+                            * sample_rate as f64 * num_channels as f64) as u64;
+                        self.visible_range = audio_range::AudioRange::new(0, visible_samples, 10);
+                    },
+                    Err(e) => {
+                        println!("Error starting loader: {}", e);
+                    }
                 }
             }
         }
@@ -114,189 +148,121 @@ impl AudioVisualizer {
 
     // Request chunks based on current view
     fn check_buffer_needs(&mut self) {
-        if !self.audio_loader.is_running() {
-            return; // No loader running
+        if self.buffer_manager.is_none() {
+            return;
         }
-
+        
+        // Update buffer manager to receive any loaded chunks
+        if let Some(buffer_manager) = &mut self.buffer_manager {
+            let _ = buffer_manager.update();
+        }
+        
         // Get current scroll position and visible window from widget
         let scroll_offset = self.waveform_widget.scroll_offset();
         let visible_time_window = self.waveform_widget.visible_time_window();
-
+        
         // Convert visible window to samples
         let visible_samples_start = (scroll_offset.to_num::<f64>() * self.sample_rate as f64 * self.num_channels as f64) as u64;
         let visible_samples_end = ((scroll_offset + visible_time_window).to_num::<f64>() * self.sample_rate as f64 * self.num_channels as f64) as u64;
-
-        // Calculate what chunk the visible area starts and ends in
-        let start_chunk = visible_samples_start / self.chunk_size;
-        let end_chunk = (visible_samples_end + self.chunk_size - 1) / self.chunk_size; // Ceiling division
-
-        // Load a few chunks ahead and behind
-        let buffer_chunks = 2; // Number of chunks to buffer in each direction
-
-        // Calculate the range of chunks we should have loaded
-        let should_load_start = start_chunk.saturating_sub(buffer_chunks);
-        let should_load_end = end_chunk + buffer_chunks;
-
-        // Request chunks that should be loaded
-        for chunk_idx in should_load_start..=should_load_end {
-            let chunk_pos = chunk_idx * self.chunk_size;
-
-            // Check if this chunk is already loaded or pending
-            let is_loaded = if chunk_pos < self.chunk_start {
-                false // Before our buffer
-            } else {
-                let relative_pos = chunk_pos - self.chunk_start;
-                let idx = (relative_pos / self.chunk_size) as usize;
-                idx < self.chunks.len()
-            };
-
-            let is_pending = self.pending_chunks.contains(&chunk_pos);
-
-            if !is_loaded && !is_pending && chunk_pos < self.total_samples {
-                self.load_chunk_at_position(chunk_pos);
+        
+        // Update the visible range
+        self.visible_range = audio_range::AudioRange::new(visible_samples_start, visible_samples_end, 10);
+        
+        // Calculate a pre-buffer range for playback if playing
+        if self.playing {
+            let buffer_duration = 5; // 5 seconds ahead
+            let play_end = self.play_position + (buffer_duration * self.sample_rate as u64 * self.num_channels as u64);
+            self.playback_range = Some(audio_range::AudioRange::new(self.play_position, play_end, 5));
+        } else {
+            self.playback_range = None;
+        }
+        
+        // Create a list of ranges to ensure are loaded
+        let mut ranges_to_load = Vec::new();
+        
+        // Always load the visible range
+        ranges_to_load.push((self.visible_range.start, self.visible_range.end));
+        
+        // Add playback range if playing
+        if let Some(ref range) = self.playback_range {
+            ranges_to_load.push((range.start, range.end));
+        }
+        
+        // Ensure all ranges are loaded
+        if let Some(buffer_manager) = &mut self.buffer_manager {
+            if let Err(e) = buffer_manager.ensure_loaded(&ranges_to_load) {
+                println!("Error ensuring ranges are loaded: {}", e);
+            }
+            
+            // Update loading status
+            self.is_loading = buffer_manager.pending_count() > 0;
+            
+            // Update loaded percentage for the visible range
+            if let Ok(proportion) = buffer_manager.storage_handle().loaded_proportion(
+                self.visible_range.start, self.visible_range.end
+            ) {
+                self.loaded_percentage = proportion * 100.0;
             }
         }
     }
 
-    fn load_chunk_at_position(&mut self, position: u64) {
-        if !self.audio_loader.is_running() {
-            return;
-        }
-
-        println!("Requesting chunk at position: {}", position);
-
-        // Ensure position is aligned to chunk boundaries
-        let aligned_position = (position / self.chunk_size) * self.chunk_size;
-
-        // Check if this chunk is already loaded
-        let relative_pos = aligned_position.checked_sub(self.chunk_start);
-        if let Some(rel_pos) = relative_pos {
-            let chunk_index = (rel_pos / self.chunk_size) as usize;
-            if chunk_index < self.chunks.len() {
-                // Already loaded
-                println!("Chunk already loaded at index {}", chunk_index);
-                return;
-            }
-        }
-        
-        // Check if this chunk is already pending
-        if self.pending_chunks.contains(&aligned_position) {
-            println!("Chunk already pending at position {}", aligned_position);
-            return;
-        }
-
-        // Request the chunk from the loader
-        self.audio_loader.request_chunk(aligned_position);
-        self.pending_chunks.push(aligned_position);
-        self.is_loading = true;
-    }
-
-    fn update_chunks(&mut self) {
-        if !self.audio_loader.is_running() {
-            return;
-        }
-        
-        // Get responses from the loader
-        let responses = self.audio_loader.poll_responses();
-        let mut chunks_updated = false;
-        
-        for response in responses {
-            match response {
-                LoaderResponse::ChunkLoaded(position, samples) => {
-                    println!("Received chunk at position: {}, size: {}", position, samples.len());
+    fn update_waveform_data(&mut self) {
+        if let Some(buffer_manager) = &mut self.buffer_manager {
+            // Get the visible range
+            let visible_start = self.visible_range.start;
+            let visible_len = self.visible_range.len();
+            
+            // Get samples for the visible range
+            match buffer_manager.storage_handle().get_samples(visible_start, visible_len) {
+                Ok(samples) => {
+                    // Check if we need to create fake chunks for the waveform widget
+                    // or if we need to modify the waveform widget to accept a single buffer
                     
-                    // Determine if this should be prepended or appended
-                    if position < self.chunk_start {
-                        // Prepend to the front
-                        println!("Prepending chunk at position {}", position);
-                        self.chunks.push_front(samples);
-                        self.chunk_start = position;
+                    // Option 1: Create fake chunks
+                    let chunk_size = BUFFER_SIZE as u64;
+                    let mut chunks = VecDeque::new();
+                    
+                    for i in 0..(visible_len + chunk_size - 1) / chunk_size {
+                        let start_idx = (i * chunk_size) as usize;
+                        let end_idx = ((i + 1) * chunk_size).min(visible_len) as usize;
                         
-                        // If we have too many chunks, remove from the back
-                        while self.chunks.len() > self.max_chunks {
-                            self.chunks.pop_back();
-                        }
-                        
-                        chunks_updated = true;
-                    } else {
-                        // Check if this is an insert in the middle
-                        let relative_pos = position - self.chunk_start;
-                        let chunk_index = (relative_pos / self.chunk_size) as usize;
-                        
-                        if chunk_index < self.chunks.len() {
-                            // Replace existing chunk
-                            println!("Replacing chunk at index {}", chunk_index);
-                            if let Some(chunk) = self.chunks.get_mut(chunk_index) {
-                                *chunk = samples;
-                            }
-                            chunks_updated = true;
-                        } else if chunk_index == self.chunks.len() {
-                            // Append to the end
-                            println!("Appending chunk at end");
-                            self.chunks.push_back(samples);
+                        if start_idx < samples.len() {
+                            let chunk_samples = if end_idx <= samples.len() {
+                                samples[start_idx..end_idx].to_vec()
+                            } else {
+                                // Pad with zeros if needed
+                                let mut chunk = samples[start_idx..].to_vec();
+                                chunk.resize(end_idx - start_idx, 0.0);
+                                chunk
+                            };
                             
-                            // If we have too many chunks, remove from the front
-                            while self.chunks.len() > self.max_chunks {
-                                self.chunks.pop_front();
-                                self.chunk_start += self.chunk_size;
-                            }
-                            
-                            chunks_updated = true;
-                        } else {
-                            println!("Warning: received out-of-order chunk at position {}", position);
-                            // Could handle this better, but for now just append
-                            self.chunks.push_back(samples);
-                            chunks_updated = true;
+                            chunks.push_back(chunk_samples);
                         }
                     }
                     
-                    // Remove this position from pending list
-                    if let Some(index) = self.pending_chunks.iter().position(|&p| p == position) {
-                        self.pending_chunks.remove(index);
-                    }
+                    // Set the chunks in the waveform widget
+                    self.waveform_widget.set_chunks(chunks, visible_start, chunk_size);
                     
-                    // Update loaded percentage
-                    let buffer_samples = self.chunks.len() as u64 * self.chunk_size;
-                    self.loaded_percentage = buffer_samples as f32 / self.total_samples as f32 * 100.0;
+                    // Option 2: Modify waveform_widget.rs to accept a single buffer
+                    // This would be more efficient but requires changing the widget
                 },
-                LoaderResponse::LoadingError(e) => {
-                    println!("Loading error: {}", e);
-                    // Could clear pending chunks here
-                },
-                LoaderResponse::Progress(progress) => {
-                    // Update loading progress
-                    println!("Loading progress: {}%", progress);
-                },
-                LoaderResponse::FileInfo { sample_rate, num_channels, total_samples } => {
-                    println!("Received file info: sample_rate={}, channels={}, total_samples={}",
-                             sample_rate, num_channels, total_samples);
-                    self.sample_rate = sample_rate;
-                    self.num_channels = num_channels;
-                    // self.total_samples = total_samples;
-                    
-                    // Update the waveform widget with audio info
-                    self.waveform_widget.set_audio_info(sample_rate, num_channels, total_samples);
+                Err(e) => {
+                    println!("Error getting samples for waveform: {}", e);
                 }
             }
         }
-        
-        // Update waveform widget with new chunks if needed
-        if chunks_updated {
-            self.waveform_widget.set_chunks(self.chunks.clone(), self.chunk_start, self.chunk_size);
-        }
-        
-        // Update loading status
-        self.is_loading = !self.pending_chunks.is_empty();
     }
+        
 }
 
 impl eframe::App for AudioVisualizer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Update chunks from the loader
-        self.update_chunks();
-
+        
         // Check if we need to load more chunks based on the visible area
         self.check_buffer_needs();
+
+        // Update waveform data
+        self.update_waveform_data();
 
         // Main app menu
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -325,26 +291,13 @@ impl eframe::App for AudioVisualizer {
                     ui.separator();
                     ui.label(format!("Loaded: {:.1}%", self.loaded_percentage));
                     ui.separator();
-                    ui.label(format!("Buffer: {} chunks", self.chunks.len()));
-                    ui.separator();
                     ui.label(format!("Position: {} samples", self.chunk_start));
                     ui.separator();
                     // Display fixed-point values with high precision
                     ui.label(format!("Time: {:.6} s", self.waveform_widget.scroll_offset()));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Next Chunk").clicked() {
-                            let next_pos = self.chunk_start + self.chunk_size * self.chunks.len() as u64;
-                            if next_pos < self.total_samples {
-                                self.load_chunk_at_position(next_pos);
-                            }
-                        }
-                        if ui.button("Previous Chunk").clicked() {
-                            if self.chunk_start > 0 {
-                                let prev_pos = self.chunk_start.saturating_sub(self.chunk_size);
-                                self.load_chunk_at_position(prev_pos);
-                            }
-                        }
+                        // TODO: add some buttons
                     });
                 } else {
                     ui.label("No file loaded. Use File > Open to load an audio file.");
